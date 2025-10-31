@@ -1,1 +1,1 @@
-from.UNet import *
+from .UNet import *
