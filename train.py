@@ -45,12 +45,12 @@ model_path = './checkpoints/best_model.pth'
 lambda_combined = 1
 
 # Proxy Loss 파라미터
-proxy_type = 'ProxyAnchorLoss'  # 'ProxyAnchorLoss', 'FocalStyleProxyAnchorLoss'
+proxy_type = 'ProxyAnchorLoss'  # 'ProxyAnchorLoss', ' FocalStyleProxyAnchorLoss' 
 proxy_alpha = 32.0
 proxy_delta = 0.1
 
-# 데이터 전처리 설정 (이 값들을 바꾸면 자동으로 해당 설정으로 전처리됨)
-segment_seconds = 5.0  # ECG 세그먼트 길이 (초) - 1.0, 3.0, 5.0 등으로 변경 가능
+# 데이터 전처리 설정 (매번 새로 전처리됨)
+segment_seconds = 5.0  # ECG 세그먼트 길이 (초) - 논문 방식: 5.0초 (1800 샘플)
 fs_out = 360           # 출력 샘플링 주파수 (Hz)
 ecg_leads = ['MLII']   # 사용할 ECG 리드 ['MLII'], ['V1'], ['MLII', 'V1'] 등
 
@@ -90,7 +90,8 @@ class Trainer:
         """모델 초기화"""
         global inputs, classes
         
-        self.model = SEResNetLSTM(in_channel=inputs, num_classes=classes).to(self.device)    
+        # self.model = SEResNetLSTM(in_channel=inputs, num_classes=classes).to(self.device)    
+        self.model = UNet(nOUT=classes, in_channels=inputs, rub0_layers=7).to(self.device)
         # self.model = DCRNNModel(in_channel=inputs, num_classes=classes).to(self.device)
 
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -102,14 +103,11 @@ class Trainer:
     def _setup_data(self):
         global batch_size, segment_seconds, fs_out
         
-        print(f"{'='*80}")
-        print(f"Segment Length: {segment_seconds}s ({int(segment_seconds * fs_out)} samples)")
-        print(f"{'='*80}\n")
-        
-        # Train 데이터 로드 (자동 전처리 & 캐싱)
+
+        # Train 데이터 로드 (매번 새로 전처리)
         self.train_loader = load_train_data(batch_size, num_workers=4)
         
-        # Test 데이터 로드 (자동 전처리 & 캐싱)
+        # Test 데이터 로드 (train에서 전처리한 데이터 사용)
         self.valid_loader = load_test_data(batch_size, num_workers=4)
         self.test_loader = self.valid_loader
         
@@ -272,7 +270,10 @@ class Trainer:
     def _test_with_best_model(self):
         """
         최고 성능 모델로 테스트 수행
+        Proxy Loss 사용 시 거리 기반 예측 적용
         """
+        global lambda_combined
+        
         self._load_best_model()
         self.model.eval()
         
@@ -284,11 +285,16 @@ class Trainer:
                 X = X.float().to(self.device)
                 Y = Y.long().to(self.device)
                 
-                # return_features=True로 수정 (모델이 (logits, features) 반환)
-                pred, _ = self.model(X, return_features=True)
-                pred = torch.argmax(pred, dim=1)
+                # 모델 출력
+                outputs, features = self.model(X, return_features=True)
                 
-                pred_labels.extend(pred.cpu().numpy())
+                # lambda_combined에 따라 예측 방식 결정
+                preds = get_predictions(
+                    outputs, features, 
+                    self.model.get_proxies() if lambda_combined < 1.0 else None
+                )
+                
+                pred_labels.extend(preds.cpu().numpy())
                 true_labels.extend(Y.cpu().numpy())
         
         pred_labels = np.array(pred_labels)
@@ -314,28 +320,30 @@ class Trainer:
         sensitivity = tp / (tp + fn + eps)
         specificity = tn / (tn + fp + eps)
         ppv = tp / (tp + fp + eps)
-        youden = sensitivity + specificity - 1.0
         acc_cls = (tp + tn) / total
+        
+        # Per-class F1 scores
+        per_class_f1 = f1_score(true_labels, pred_labels, labels=list(range(num_classes)), average=None, zero_division=0)
         
         # Macro averages (all classes)
         se_macro = float(np.mean(sensitivity))
         sp_macro = float(np.mean(specificity))
         ppv_macro = float(np.mean(ppv))
-        youden_macro = float(np.mean(youden))
+        f1_macro = float(np.mean(per_class_f1))
         
         # Package results
         all_class_metrics = {
             'accuracy': overall_acc,
-            'weighted_f1': float(f1_score(true_labels, pred_labels, average='weighted', zero_division=0)),
+            'weighted_f1': float(f1_score(true_labels, pred_labels, labels=[0, 1, 2, 3, 4], average='weighted', zero_division=0)),
+            'macro_f1': f1_macro,
             'sensitivity': sensitivity.tolist(),
             'specificity': specificity.tolist(),
             'ppv': ppv.tolist(),
-            'youden': youden.tolist(),
+            'f1': per_class_f1.tolist(),
             'acc_per_class': acc_cls.tolist(),
             'weighted_sensitivity': se_macro,
             'weighted_specificity': sp_macro,
             'weighted_ppv': ppv_macro,
-            'weighted_youden': youden_macro
         }
         
         # Print results
@@ -357,12 +365,13 @@ class Trainer:
 
     def _print_test_results(self, all_class_metrics, class_names, cm, true_labels, pred_labels):
         """
-        테스트 결과를 보기 좋게 출력 (confusion matrix와 classification report 포함)
+        테스트 결과 출력 (confusion matrix와 classification report 포함)
         """
         print("\n" + "="*80)
         print("FINAL TEST RESULTS (Best Model Selected by Test Set)")
         print("="*80)
         print(f"Overall Accuracy: {all_class_metrics['accuracy']:.4f}")
+        print(f"Macro F1: {all_class_metrics['macro_f1']:.4f}")
         print(f"Weighted F1: {all_class_metrics['weighted_f1']:.4f}")
         
         # Confusion Matrix 출력
@@ -388,6 +397,7 @@ class Trainer:
         report = classification_report(
             true_labels, 
             pred_labels, 
+            labels=[0, 1, 2, 3, 4],  # N, S, V, F, Q 5개 클래스 모두 명시
             target_names=class_names,
             digits=4,
             zero_division=0
@@ -398,36 +408,36 @@ class Trainer:
         print("\n" + "-"*80)
         print("CUSTOM METRICS (ALL CLASSES: N, S, V, F, Q)")
         print("-"*80)
-        print(f"{'Class':<10} {'Acc':<10} {'Sens':<10} {'Spec':<10} {'PPV':<10} {'Youden':<10}")
+        print(f"{'Class':<10} {'Acc':<10} {'Sens':<10} {'Spec':<10} {'PPV':<10} {'F1':<10}")
         print("-"*80)
         
         for i, name in enumerate(class_names):
-            print(f"{name:<10} "
-                f"{all_class_metrics['acc_per_class'][i]:<10.4f} "
-                f"{all_class_metrics['sensitivity'][i]:<10.4f} "
-                f"{all_class_metrics['specificity'][i]:<10.4f} "
-                f"{all_class_metrics['ppv'][i]:<10.4f} "
-                f"{all_class_metrics['youden'][i]:<10.4f}")
-        
+            # 인덱스 범위 체크 (일부 클래스가 데이터에 없을 수 있음)
+            if i < len(all_class_metrics['acc_per_class']):
+                print(f"{name:<10} "
+                    f"{all_class_metrics['acc_per_class'][i]:<10.4f} "
+                    f"{all_class_metrics['sensitivity'][i]:<10.4f} "
+                    f"{all_class_metrics['specificity'][i]:<10.4f} "
+                    f"{all_class_metrics['ppv'][i]:<10.4f} "
+                    f"{all_class_metrics['f1'][i]:<10.4f} "
+                    )
+            else:
+                print(f"{name:<10} {'N/A':<10} {'N/A':<10} {'N/A':<10} {'N/A':<10} {'N/A':<10}")
         print("-"*80)
         print(f"{'MACRO AVG':<10} "
             f"{'':<10} "
             f"{all_class_metrics['weighted_sensitivity']:<10.4f} "
             f"{all_class_metrics['weighted_specificity']:<10.4f} "
-            f"{all_class_metrics['weighted_ppv']:<10.4f} "
-            f"{all_class_metrics['weighted_youden']:<10.4f}")
-        
+            f"{all_class_metrics['weighted_ppv']:<10.4f} "  
+            f"{all_class_metrics['macro_f1']:<10.4f} "
+            )
         print("\n" + "-"*80)
         print("="*80 + "\n")
     
     def _save_checkpoint(self, epoch, f1_score, is_best): 
         """
         체크포인트 저장
-        
-        Args:
-            epoch: 현재 에포크
-            f1_score: 현재 F1 스코어
-            is_best: 최고 성능 모델 여부
+
         """
         model_dir = get_model_dir(self.logger.log_dir)
         checkpoint = create_checkpoint(
@@ -477,5 +487,134 @@ def main():
     trainer.train()
 
 
+def main_receptive_field_experiments():
+    """
+    Receptive Field 실험 자동화
+    
+    실험 1-4: UNet rub0_layers [5, 6, 7, 8]
+    실험 5-9: SE-ResNet-LSTM dilation [1, 2, 3, 4, 5]
+    """
+    global lambda_combined, classes, inputs
+    
+    print("\n" + "="*80)
+    print("RECEPTIVE FIELD EXPERIMENTS - CE LOSS ONLY")
+    print("="*80)
+    print(f"Total Experiments: 9")
+    print(f"  - UNet (rub0_layers): 4 experiments")
+    print(f"  - SE-ResNet-LSTM (dilation): 5 experiments")
+    print(f"  - lambda_combined: 1.0 (CE only)")
+    print("="*80 + "\n")
+    
+    # ===== 실험 1-4: UNet rub0_layers =====
+    print("\n" + "="*80)
+    print("PART 1: UNet Receptive Field Test")
+    print("="*80 + "\n")
+    
+    rub0_layers_list = [5, 6, 7, 8]
+    
+    for exp_num, rub0_layers in enumerate(rub0_layers_list, start=1):
+        print(f"\n{'='*80}")
+        print(f"Experiment {exp_num}/9: UNet with rub0_layers={rub0_layers}")
+        print(f"{'='*80}\n")
+        
+        # CE only로 고정
+        globals()['lambda_combined'] = 1.0
+        print(f"[DEBUG] lambda_combined set to: {globals()['lambda_combined']}")
+        
+        set_seed()
+        
+        # 모델 변경을 위한 Trainer 수정
+        class UNetTrainer(Trainer):
+            def _setup_model(self):
+                self.model = UNet(nOUT=classes, in_channels=inputs, rub0_layers=rub0_layers).to(self.device)
+                total_params = sum(p.numel() for p in self.model.parameters())
+                print(f"\n{'='*70}")
+                print(f"Model: UNet (rub0_layers={rub0_layers})")
+                print(f"Model Parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+                print(f"{'='*70}\n")
+            
+            def _setup_logger(self):
+                """로거 초기화 with 실험 정보"""
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                exp_name = f"UNet_rub0_{rub0_layers}"
+                log_dir = os.path.join(os.getcwd(), 'logs', f'{timestamp}_{exp_name}')
+                
+                os.makedirs(os.path.join(log_dir, 'tensorboard'), exist_ok=True)
+                os.makedirs(os.path.join(log_dir, 'checkpoints'), exist_ok=True)
+                
+                self.logger = Logger(os.path.join(log_dir, 'tensorboard'), self.class_names)
+        
+        trainer = UNetTrainer()
+        trainer.train()
+        
+        print(f"\n{'='*80}")
+        print(f"Experiment {exp_num}/9 Completed: UNet rub0_layers={rub0_layers}")
+        print(f"{'='*80}\n")
+    
+    # ===== 실험 5-9: SE-ResNet-LSTM dilation =====
+    print("\n" + "="*80)
+    print("PART 2: SE-ResNet-LSTM Dilation Test")
+    print("="*80 + "\n")
+    
+    dilation_list = [1, 2, 3, 4, 5]
+    
+    for exp_num, dilation in enumerate(dilation_list, start=5):
+        print(f"\n{'='*80}")
+        print(f"Experiment {exp_num}/9: SE-ResNet-LSTM with dilation={dilation}")
+        print(f"{'='*80}\n")
+        
+        # CE only로 고정
+        globals()['lambda_combined'] = 1.0
+        print(f"[DEBUG] lambda_combined set to: {globals()['lambda_combined']}")
+        
+        set_seed()
+        
+        # SE-ResNet-LSTM with dilation
+        class SEResNetLSTMTrainer(Trainer):
+            def _setup_model(self):
+                self.model = SEResNetLSTM(
+                    in_channel=inputs, 
+                    num_classes=classes,
+                    dilation=dilation
+                ).to(self.device)
+                total_params = sum(p.numel() for p in self.model.parameters())
+                print(f"\n{'='*70}")
+                print(f"Model: SE-ResNet-LSTM (dilation={dilation})")
+                print(f"Model Parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+                print(f"{'='*70}\n")
+            
+            def _setup_logger(self):
+                """로거 초기화 with 실험 정보"""
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                exp_name = f"SEResNetLSTM_dilation_{dilation}"
+                log_dir = os.path.join(os.getcwd(), 'logs', f'{timestamp}_{exp_name}')
+                
+                os.makedirs(os.path.join(log_dir, 'tensorboard'), exist_ok=True)
+                os.makedirs(os.path.join(log_dir, 'checkpoints'), exist_ok=True)
+                
+                self.logger = Logger(os.path.join(log_dir, 'tensorboard'), self.class_names)
+        
+        trainer = SEResNetLSTMTrainer()
+        trainer.train()
+        
+        print(f"\n{'='*80}")
+        print(f"Experiment {exp_num}/9 Completed: SE-ResNet-LSTM dilation={dilation}")
+        print(f"{'='*80}\n")
+    
+    print("\n" + "="*80)
+    print("ALL 9 EXPERIMENTS COMPLETED!")
+    print("="*80)
+    print("Summary:")
+    print("  - UNet (rub0_layers=5,6,7,8): 4 experiments")
+    print("  - SE-ResNet-LSTM (dilation=1,2,3,4,5): 5 experiments")
+    print("  - Total: 9 experiments")
+    print("="*80 + "\n")
+
+
+# if __name__ == '__main__':
+#     main()
+
 if __name__ == '__main__':
-    main()
+    main_receptive_field_experiments()
