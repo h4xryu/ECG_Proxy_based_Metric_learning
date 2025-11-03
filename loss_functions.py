@@ -160,21 +160,19 @@ def setup_losses():
     
     Returns:
         cross_entropy_loss: CE loss (always initialized)
-        proxy_loss: Proxy loss (None if lambda_combined=1.0)
+        proxy_loss: Proxy loss (always initialized, used based on lambda_combined at runtime)
     """
-    from train import lambda_combined, proxy_type, proxy_alpha, proxy_delta
+    from train import proxy_type, proxy_alpha, proxy_delta
     
     cross_entropy_loss = nn.CrossEntropyLoss(reduction='mean')
-    proxy_loss = None
     
-    # lambda < 1.0이면 Proxy loss 사용
-    if lambda_combined < 1.0:
-        if proxy_type == 'ProxyAnchorLoss':
-            proxy_loss = ProxyAnchorLoss(alpha=proxy_alpha, delta=proxy_delta)
-        elif proxy_type == 'FocalStyleProxyAnchorLoss':
-            proxy_loss = FocalStyleProxyAnchorLoss(alpha=proxy_alpha, delta=proxy_delta)
-        else:
-            raise ValueError(f"Unknown proxy_type: {proxy_type}")
+    # Proxy loss는 항상 초기화 (lambda_combined는 런타임에 체크)
+    if proxy_type == 'ProxyAnchorLoss':
+        proxy_loss = ProxyAnchorLoss(alpha=proxy_alpha, delta=proxy_delta)
+    elif proxy_type == 'FocalStyleProxyAnchorLoss':
+        proxy_loss = FocalStyleProxyAnchorLoss(alpha=proxy_alpha, delta=proxy_delta)
+    else:
+        raise ValueError(f"Unknown proxy_type: {proxy_type}")
     
     return cross_entropy_loss, proxy_loss
 
@@ -191,15 +189,6 @@ def compute_loss(outputs, features, labels, cross_entropy_loss,
     - λ = 0.0: Proxy only
     - 0 < λ < 1: Combined
     
-    Proxy-Anchor Loss:
-        L_PA = (1/|P+|) Σ log(1 + Σ exp(-α(s(x,p)-δ)))
-             + (1/|P|)  Σ log(1 + Σ exp(α(s(x,p)+δ)))
-    
-    where:
-        s(x,p): cosine similarity between sample x and proxy p
-        α: scaling factor (temperature)
-        δ: margin
-        P+: positive proxies
     """
     from train import lambda_combined
     
@@ -208,10 +197,10 @@ def compute_loss(outputs, features, labels, cross_entropy_loss,
     
     # Proxy Loss (computed if lambda < 1.0)
     proxy_loss_val = torch.tensor(0.0, device=device)
-    if lambda_combined < 1.0 and proxy_loss is not None:
+    if lambda_combined < 1.0:
         proxy_loss_val = proxy_loss(features, labels, model_proxies)
     
-    # Combined loss: λ*CE + (1-λ)*Proxy
+    # λ*CE + (1-λ)*Proxy
     total_loss = lambda_combined * ce_loss + (1 - lambda_combined) * proxy_loss_val
     
     return total_loss, proxy_loss_val, ce_loss
@@ -219,7 +208,6 @@ def compute_loss(outputs, features, labels, cross_entropy_loss,
 
 def get_predictions(outputs, features, model_proxies):
     """
-    예측 레이블 추출
     
     - λ > 0: argmax 사용 (분류기 출력)
     - λ = 0: proxy inference 사용 (nearest proxy)
