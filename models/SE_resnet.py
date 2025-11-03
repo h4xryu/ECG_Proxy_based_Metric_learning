@@ -32,10 +32,11 @@ class Bottleneck(nn.Module):
     """
     SE-ResNet Bottleneck Block for 1D
     expansion = 4 (기본값, 조정 가능)
+    dilation을 통해 receptive field 조정 가능
     """
     expansion = 4
     
-    def __init__(self, inplanes, planes, stride=1, downsample=None, reduction=16, expansion=None):
+    def __init__(self, inplanes, planes, stride=1, downsample=None, reduction=16, expansion=None, dilation=1):
         super(Bottleneck, self).__init__()
         
         # expansion 동적 설정
@@ -45,9 +46,9 @@ class Bottleneck(nn.Module):
         # 1x1 conv
         self.conv1 = nn.Conv1d(inplanes, planes, kernel_size=1, bias=False)
         self.bn1 = nn.BatchNorm1d(planes)
-        # 3x3 conv
+        # 3x3 conv with dilation
         self.conv2 = nn.Conv1d(planes, planes, kernel_size=3, stride=stride,
-                               padding=1, bias=False)
+                               padding=dilation, dilation=dilation, bias=False)
         self.bn2 = nn.BatchNorm1d(planes)
         # 1x1 conv (expansion)
         self.conv3 = nn.Conv1d(planes, planes * self.expansion, kernel_size=1, bias=False)
@@ -89,10 +90,11 @@ class Bottleneck(nn.Module):
 class SEResNetLSTM_backbone(nn.Module):
 
     def __init__(self, block, layers, in_channel=1, num_classes=5,
-                 lstm_hidden=128, lstm_layers=2, reduction=16):
+                 lstm_hidden=128, lstm_layers=2, reduction=16, dilation=1):
         super(SEResNetLSTM_backbone, self).__init__()
         self.inplanes = 64
         self.reduction = reduction
+        self.dilation = dilation
         
         # Initial layers
         self.conv1 = nn.Conv1d(in_channel, 64, kernel_size=15, stride=2, padding=7, bias=False)
@@ -100,12 +102,12 @@ class SEResNetLSTM_backbone(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
         
-        self.layer1 = self._make_layer(block, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
-        # self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer1 = self._make_layer(block, 64, layers[0], dilation=dilation)
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2, dilation=dilation)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2, dilation=dilation)
 
         # LSTM의 input_size는 layer3의 출력 채널 수
-        lstm_input_size = 128 * block.expansion  # 256 * 4 = 1024
+        lstm_input_size = 256 * block.expansion  # 256 * 4 = 1024
         
         # LSTM
         self.lstm = nn.LSTM(
@@ -113,12 +115,12 @@ class SEResNetLSTM_backbone(nn.Module):
             hidden_size=lstm_hidden,
             num_layers=lstm_layers,
             batch_first=True,
-            bidirectional=False,
+            bidirectional=True,
             dropout=0.2 if lstm_layers > 1 else 0   
         )
         
         # Feature dimension
-        self.feature_dim = lstm_hidden  # Bidirectional
+        self.feature_dim = lstm_hidden  *2 # Bidirectional
         
         # Classification head
         self.fc = nn.Linear(self.feature_dim, num_classes)
@@ -136,8 +138,8 @@ class SEResNetLSTM_backbone(nn.Module):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
     
-    def _make_layer(self, block, planes, blocks, stride=1):
-        """ResNet layer 생성"""
+    def _make_layer(self, block, planes, blocks, stride=1, dilation=1):
+        """ResNet layer 생성 with dilation"""
         downsample = None
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = nn.Sequential(
@@ -147,10 +149,10 @@ class SEResNetLSTM_backbone(nn.Module):
             )
         
         layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample, self.reduction))
+        layers.append(block(self.inplanes, planes, stride, downsample, self.reduction, dilation=dilation))
         self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
-            layers.append(block(self.inplanes, planes, reduction=self.reduction))
+            layers.append(block(self.inplanes, planes, reduction=self.reduction, dilation=dilation))
         
         return nn.Sequential(*layers)
     
@@ -165,7 +167,7 @@ class SEResNetLSTM_backbone(nn.Module):
         # SE-ResNet layers
         x = self.layer1(x)
         x = self.layer2(x)
-        # x = self.layer3(x)
+        x = self.layer3(x)
         
         # LSTM
         x = x.permute(0, 2, 1)  # [B, L', C]
@@ -188,15 +190,22 @@ class SEResNetLSTM_backbone(nn.Module):
 
 # ===================== 모델 버전 (ResNet 스타일) =====================
 
-def SEResNetLSTM(in_channel=1, num_classes=5):
-
+def SEResNetLSTM(in_channel=1, num_classes=5, dilation=1):
+    """
+    SE-ResNet + LSTM with configurable dilation
+    
+    Args:
+        dilation: Dilation rate for bottleneck conv (1-5)
+                  Higher dilation = larger receptive field
+    """
     return SEResNetLSTM_backbone(
         Bottleneck, [2, 2, 2],
         in_channel=in_channel,
         num_classes=num_classes,
         lstm_hidden=50,
         lstm_layers=1,
-        reduction=16
+        reduction=16,
+        dilation=dilation
     )
 
 
