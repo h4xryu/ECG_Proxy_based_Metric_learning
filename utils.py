@@ -13,9 +13,11 @@ from datetime import datetime
 from collections import Counter
 from tqdm import tqdm
 from scipy.interpolate import interp1d
-from scipy.signal import firwin, filtfilt
+from scipy.signal import firwin, filtfilt, medfilt
+import pywt
 from torch.utils.data import DataLoader
 from dataloader import ECGDataloader
+import matplotlib.pyplot as plt
 
 
 """
@@ -74,27 +76,40 @@ def resample_signal(signal, fs_in, fs_out, target_length):
     return interp1d(x_old, signal)(x_new)
 
 
-def apply_bandpass_filter(signal, fs=360, lowcut=0.1, highcut=100.0, filter_order=256):
-    """FIR 밴드패스 필터 적용 (0.1-100Hz)"""
-    nyquist = fs / 2.0
-    low = lowcut / nyquist
-    high = highcut / nyquist
+def apply_dwt_denoise(signal, wavelet='db6', level=9):
+    """DWT (Discrete Wavelet Transform)를 사용한 denoising
     
-    fir_coeff = firwin(filter_order + 1, [low, high], pass_zero=False)
-    filtered_signal = filtfilt(fir_coeff, 1.0, signal)
+    논문: Daubechies 6 (db6) 웨이블릿을 사용하여 baseline wander와 노이즈 제거
+    """
+    # DWT 분해
+    coeffs = pywt.wavedec(signal, wavelet, level=level)
     
-    return filtered_signal
+    # 임계값 기반 denoising (soft thresholding)
+    # 첫 번째 계수(근사 계수)는 유지, 나머지 상세 계수들만 thresholding
+    sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+    threshold = sigma * np.sqrt(2 * np.log(len(signal)))
+    
+    coeffs[1:] = [pywt.threshold(c, threshold, mode='soft') for c in coeffs[1:]]
+    
+    # DWT 재구성
+    denoised_signal = pywt.waverec(coeffs, wavelet)
+    
+    # 원본 신호와 길이를 맞춤
+    return denoised_signal[:len(signal)]
 
 
 def preprocess_leads(sig_data, sig_names, leads, fs):
-    """선택된 리드에 대해 밴드패스 필터 적용"""
+    """선택된 리드에 대해 DWT 필터 적용 (논문 방식)"""
     filtered_data = {}
     for lead in leads:
         if lead in sig_names:
             idx = sig_names.index(lead)
             raw_signal = sig_data[:, idx]
-            filtered = apply_bandpass_filter(raw_signal, fs=fs, lowcut=0.1, highcut=100.0)
-            filtered_data[lead] = filtered
+            
+            # DWT with db6 웨이블릿으로 baseline wander와 노이즈 제거
+            signal_filtered = apply_dwt_denoise(raw_signal, wavelet='db6', level=9)
+            
+            filtered_data[lead] = signal_filtered
     return filtered_data
 
 
@@ -119,49 +134,155 @@ def extract_single_beat(filtered_data, leads, start, end, fs, fs_out, target_len
     if len(segment) != len(leads):
         return None
     
-    # Single lead: (target_length,) 형태
+    # Single lead: (target_length,) 형태 - normalize 제거 (논문에 없음)
     if len(leads) == 1:
         segment = segment[0].astype(np.float32)
-        segment = normalize_beat(segment)
     # Multi lead: (num_leads, target_length) 형태
     else:
         segment = np.stack(segment).astype(np.float32)
-        for i in range(len(leads)):
-            segment[i] = normalize_beat(segment[i])
     
     return segment
 
 
-def extract_beats(record_path, record_name, leads, fs_out=360, segment_seconds=1.0):
-    """MIT-BIH 레코드에서 비트 추출 및 전처리"""
+def get_most_frequent_first_label(symbols_in_segment):
+    """5초 세그먼트 내에서 가장 먼저 나타나고 가장 빈번한 레이블 찾기
+    
+    논문: "We use the label of heartbeats that appear first and most frequently 
+           in the part of 5-second duration of ECG as the label for the entire part."
+    """
+    if not symbols_in_segment:
+        return None
+    
+    # 유효한 심볼만 필터링 (LABEL_GROUP_MAP에 있는 것)
+    valid_symbols = [s for s in symbols_in_segment if s in LABEL_GROUP_MAP]
+    
+    if not valid_symbols:
+        return None
+    
+    # 빈도수 계산
+    counter = Counter(valid_symbols)
+    
+    # 가장 빈번한 레이블 찾기 (빈도수가 같으면 먼저 나타난 것 선택)
+    max_count = max(counter.values())
+    most_frequent = [s for s, count in counter.items() if count == max_count]
+    
+    # 가장 먼저 나타난 것 선택
+    for s in valid_symbols:
+        if s in most_frequent:
+            return s
+    
+    return None
+
+
+def extract_5s_segments(record_path, record_name, leads, fs_out=360, segment_seconds=5.0):
+    """MIT-BIH 레코드에서 R-peak 중심 세그먼트 추출 및 전처리
+    
+    R-peak Aligned 방식:
+    - 각 R-peak annotation을 중심으로 세그먼트 추출
+    - 예: 1800 샘플이면 R-peak 기준 -900, +900 샘플
+    - DWT with db6로 전처리
+    """
     # 어노테이션 및 신호 데이터 로드
     ann_data = wfdb.rdann(os.path.join(record_path, record_name), 'atr')
     sig_data, meta = wfdb.rdsamp(os.path.join(record_path, record_name))
     fs = meta['fs']
     sig_names = meta['sig_name']
     
-    # 리드별 필터링
+    # 리드별 필터링 (DWT with db6)
     filtered_data = preprocess_leads(sig_data, sig_names, leads, fs)
     
-    # 추출 파라미터 계산
+    # 파라미터 설정
+    target_length = int(segment_seconds * fs_out)  # 5초 * 360Hz = 1800 샘플
+    half_segment = int(segment_seconds * fs / 2)  # R-peak 앞뒤로 절반씩
+    
+    segments, labels, groups = [], [], []
+    total_samples = len(sig_data)
+    
+    # 각 R-peak annotation을 중심으로 세그먼트 추출
+    for r_peak_pos, symbol in zip(ann_data.sample, ann_data.symbol):
+        # 유효한 심볼만 처리
+        if symbol not in LABEL_GROUP_MAP:
+            continue
+        
+        segment_group = LABEL_GROUP_MAP[symbol]
+        
+        # R-peak를 중심으로 앞뒤로 균등하게 자르기
+        start = r_peak_pos - half_segment
+        end = r_peak_pos + half_segment
+        
+        # 경계 체크
+        if start < 0 or end > total_samples:
+            continue
+        
+        # 세그먼트 추출
+        segment_data = []
+        for lead in leads:
+            if lead not in filtered_data:
+                segment_data = None
+                break
+            
+            lead_signal = filtered_data[lead][start:end]
+            
+            # 길이 확인
+            if len(lead_signal) != (end - start):
+                segment_data = None
+                break
+            
+            # 리샘플링
+            lead_signal_resampled = resample_signal(lead_signal, fs, fs_out, target_length)
+            segment_data.append(lead_signal_resampled)
+        
+        if segment_data is None:
+            continue
+        
+        # Single lead: (target_length,) 형태 - normalize 제거 (논문에 없음)
+        if len(leads) == 1:
+            segment_array = segment_data[0].astype(np.float32)
+        # Multi lead: (num_leads, target_length) 형태
+        else:
+            segment_array = np.stack(segment_data).astype(np.float32)
+        
+        segments.append(segment_array)
+        labels.append(symbol)
+        groups.append(segment_group)
+    
+    return segments, labels, groups
+
+
+# 이전 방식도 유지 (호환성)
+def extract_beats(record_path, record_name, leads, fs_out=360, segment_seconds=1.0):
+    """MIT-BIH 레코드에서 비트 추출 및 전처리
+    
+    논문 방식으로 5초 세그먼트를 사용하려면 extract_5s_segments 사용
+    """
+    # 5초 세그먼트 방식 사용 (논문 방식)
+    if segment_seconds >= 3.0:
+        return extract_5s_segments(record_path, record_name, leads, fs_out, segment_seconds)
+    
+    # 기존 방식 (단일 비트 추출) - 하위 호환성
+    ann_data = wfdb.rdann(os.path.join(record_path, record_name), 'atr')
+    sig_data, meta = wfdb.rdsamp(os.path.join(record_path, record_name))
+    fs = meta['fs']
+    sig_names = meta['sig_name']
+    
+    filtered_data = preprocess_leads(sig_data, sig_names, leads, fs)
+    
     target_length = int(segment_seconds * fs_out)
-    half_segment = int(segment_seconds * fs / 2)
+    samples_before = int(round(90 * fs / 360.0))
+    samples_after = int(round(110 * fs / 360.0))
     
     beats, labels, groups = [], [], []
     
-    # R-peak 위치별 비트 추출
     for pos, symbol in zip(ann_data.sample, ann_data.symbol):
         if symbol not in LABEL_GROUP_MAP:
             continue
         
-        start = pos - half_segment
-        end = pos + half_segment
+        start = pos - samples_before
+        end = pos + samples_after
         
-        # 경계 체크
         if start < 0 or end > len(sig_data):
             continue
         
-        # 비트 추출 및 전처리
         segment = extract_single_beat(
             filtered_data, leads, start, end, fs, fs_out, target_length
         )
@@ -201,20 +322,21 @@ def get_cache_dir(base_output_dir, segment_seconds, fs_out, leads):
 
 def preprocess_and_cache_mitbih(data_path, output_base_dir, segment_seconds, fs_out, leads):
     """
-    MIT-BIH 데이터를 전처리하고 캐싱
-    이미 전처리된 데이터가 있으면 로드, 없으면 전처리 후 저장
+    MIT-BIH 데이터를 전처리 (캐시 없이 매번 새로 전처리)
     """
     cache_dir = get_cache_dir(output_base_dir, segment_seconds, fs_out, leads)
     
+    # 파일 경로 정의
     train_data_path = os.path.join(cache_dir, 'train', 'train_data.npy')
     train_labels_path = os.path.join(cache_dir, 'train', 'train_labels.npy')
     test_data_path = os.path.join(cache_dir, 'test', 'test_data.npy')
     test_labels_path = os.path.join(cache_dir, 'test', 'test_labels.npy')
     
-    # 캐시된 데이터가 있으면 바로 반환
-    if all(os.path.exists(p) for p in [train_data_path, train_labels_path, test_data_path, test_labels_path]):
-        print(f"✓ 캐시된 데이터를 로드합니다: {cache_dir}")
-        return cache_dir
+    # 기존 캐시가 있으면 삭제
+    if os.path.exists(cache_dir):
+        import shutil
+        print(f"⚠ 기존 캐시 삭제 중: {cache_dir}")
+        shutil.rmtree(cache_dir)
     
     # 전처리 수행
     print(f"\n{'='*70}")
@@ -274,12 +396,12 @@ def preprocess_and_cache_mitbih(data_path, output_base_dir, segment_seconds, fs_
 def load_train_data(batch_size, num_workers=0):
     """
     학습 데이터 로드 (train.py 전역변수 사용)
-    전처리가 안되어 있으면 자동으로 전처리 후 캐싱
+    매번 새로 전처리
     """
     from train import (path_mitbih_raw, path_processed_base, 
                        segment_seconds, fs_out, ecg_leads)
     
-    # 전처리 및 캐싱
+    # 전처리 (매번 새로)
     cache_dir = preprocess_and_cache_mitbih(
         path_mitbih_raw, path_processed_base, 
         segment_seconds, fs_out, ecg_leads
@@ -309,16 +431,13 @@ def load_train_data(batch_size, num_workers=0):
 def load_test_data(batch_size, num_workers=0):
     """
     테스트 데이터 로드 (train.py 전역변수 사용)
-    전처리가 안되어 있으면 자동으로 전처리 후 캐싱
+    train_data에서 이미 전처리된 데이터 사용
     """
     from train import (path_mitbih_raw, path_processed_base, 
                        segment_seconds, fs_out, ecg_leads)
     
-    # 전처리 및 캐싱
-    cache_dir = preprocess_and_cache_mitbih(
-        path_mitbih_raw, path_processed_base, 
-        segment_seconds, fs_out, ecg_leads
-    )
+    # 전처리된 데이터 경로 가져오기
+    cache_dir = get_cache_dir(path_processed_base, segment_seconds, fs_out, ecg_leads)
     
     # 데이터 로드
     test_data = np.load(os.path.join(cache_dir, 'test', 'test_data.npy'))
@@ -339,6 +458,68 @@ def load_test_data(batch_size, num_workers=0):
     )
     
     return test_loader
+
+
+def plot_sample_ecg(sample_idx=0, dataset='train', save_path='sample_ecg.png'):
+    """
+    전처리된 ECG 샘플 시각화
+    
+    Args:
+        sample_idx: 샘플 인덱스
+        dataset: 'train' 또는 'test'
+        save_path: 저장 경로
+    """
+    from train import (path_mitbih_raw, path_processed_base, 
+                       segment_seconds, fs_out, ecg_leads)
+    
+    # 전처리된 데이터 경로
+    cache_dir = get_cache_dir(path_processed_base, segment_seconds, fs_out, ecg_leads)
+    
+    # 데이터 로드
+    data_path = os.path.join(cache_dir, dataset, f'{dataset}_data.npy')
+    labels_path = os.path.join(cache_dir, dataset, f'{dataset}_labels.npy')
+    
+    data = np.load(data_path)
+    labels = np.load(labels_path)
+    
+    # 샘플 선택
+    sample = data[sample_idx]
+    label = labels[sample_idx]
+    
+    # Plot
+    plt.figure(figsize=(15, 5))
+    
+    # 시간축 생성 (초 단위)
+    time_axis = np.linspace(0, segment_seconds, len(sample))
+    
+    plt.plot(time_axis, sample, linewidth=1.5, color='blue')
+    plt.title(f'ECG Sample #{sample_idx} - Label: {label} - 5s Segment (1800 samples @ 360Hz)', 
+              fontsize=14, fontweight='bold')
+    plt.xlabel('Time (seconds)', fontsize=12)
+    plt.ylabel('Amplitude', fontsize=12)
+    plt.grid(True, alpha=0.3)
+    
+    # 통계 정보 표시
+    stats_text = f'Mean: {sample.mean():.4f}\nStd: {sample.std():.4f}\nMin: {sample.min():.4f}\nMax: {sample.max():.4f}'
+    plt.text(0.02, 0.98, stats_text, 
+             transform=plt.gca().transAxes,
+             verticalalignment='top',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+             fontsize=10)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"\n✓ ECG 샘플 저장됨: {save_path}")
+    print(f"  - 데이터셋: {dataset}")
+    print(f"  - 샘플 인덱스: {sample_idx}")
+    print(f"  - 레이블: {label}")
+    print(f"  - Shape: {sample.shape}")
+    print(f"  - Duration: {segment_seconds}s")
+    print(f"  - Sampling Rate: {fs_out}Hz")
+    
+    plt.close()
+    
+    return sample, label
 
 
 """
