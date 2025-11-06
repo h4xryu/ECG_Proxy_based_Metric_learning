@@ -95,7 +95,7 @@ class Trainer:
         
         # self.model = SEResNetLSTM(in_channel=inputs, num_classes=classes, dilation=2).to(self.device)    
         # self.model = UNet(nOUT=classes, in_channels=inputs, rub0_layers=7).to(self.device)
-        self.model = HUnivModel(nOUT=classes, in_channels=inputs).to(self.device)
+        self.model = HUnivModel(nOUT=classes, in_channels=inputs,).to(self.device)
         # self.model = DCRNNModel(in_channel=inputs, num_classes=classes).to(self.device)
 
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -293,7 +293,7 @@ class Trainer:
                     outputs, features, 
                     self.model.get_proxies() if lambda_combined < 1.0 else None
                 )
-                
+            
                 pred_labels.extend(preds.cpu().numpy())
                 true_labels.extend(Y.cpu().numpy())
         
