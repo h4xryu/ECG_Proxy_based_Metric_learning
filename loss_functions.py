@@ -184,24 +184,35 @@ def compute_loss(outputs, features, labels, cross_entropy_loss,
     
     L = λ*L_CE + (1-λ)*L_Proxy
     
-    λ (lambda_combined) ∈ [0,1]:
+    λ (lambda_combined) ∈ [-1, 0, 1]:
+    - λ = -1: Focal Loss only
     - λ = 1.0: CE only
     - λ = 0.0: Proxy only
     - 0 < λ < 1: Combined
-    
     """
     from train import lambda_combined
+
+    if lambda_combined == -1:
+        # Focal Loss 인스턴스 생성 후 호출
+        focal_loss_fn = FocalLoss(alpha=0.25, gamma=2.0)
+        loss = focal_loss_fn(outputs, labels)
+        
+        proxy_loss_val = torch.tensor(0.0, device=device)
+        ce_loss = torch.tensor(0.0, device=device)  # 로깅용
+        
+        total_loss = loss
     
-    # CE Loss (always computed for logging)
-    ce_loss = cross_entropy_loss(outputs, labels)
-    
-    # Proxy Loss (computed if lambda < 1.0)
-    proxy_loss_val = torch.tensor(0.0, device=device)
-    if lambda_combined < 1.0:
-        proxy_loss_val = proxy_loss(features, labels, model_proxies)
-    
-    # λ*CE + (1-λ)*Proxy
-    total_loss = lambda_combined * ce_loss + (1 - lambda_combined) * proxy_loss_val
+    else:
+        # CE Loss (always computed for logging)
+        ce_loss = cross_entropy_loss(outputs, labels)
+        
+        # Proxy Loss (computed if lambda < 1.0)
+        proxy_loss_val = torch.tensor(0.0, device=device)
+        if lambda_combined < 1.0:
+            proxy_loss_val = proxy_loss(features, labels, model_proxies)
+        
+        # λ*CE + (1-λ)*Proxy
+        total_loss = lambda_combined * ce_loss + (1 - lambda_combined) * proxy_loss_val
     
     return total_loss, proxy_loss_val, ce_loss
 
