@@ -239,10 +239,18 @@ def compute_loss(outputs, features, labels, cross_entropy_loss,
 
 def get_predictions(outputs, features, model_proxies):
     """
-    
-    - λP: argmax 사용 (분류기 출력)
-    - λ = 0: proxy inference 사용 (nearest proxy)
+    - λ=1: argmax 사용 (분류기 출력)
+    - λ=0: proxy inference 사용 (nearest proxy)
     """
-    from train import lambda_combined
+    from train_batch_loss import lambda_combined
     
-    return torch.argmax(lambda_combined * outputs + (1-lambda_combined) * proxy_test2(features, model_proxies), dim=1)
+    # Handle case when model_proxies is None
+    if model_proxies is None or lambda_combined == 1.0:
+        return torch.argmax(outputs, dim=1)
+    elif lambda_combined == 0.0:
+        return torch.argmax(proxy_test2(features, model_proxies), dim=1)
+    else:
+        return torch.argmax(
+            lambda_combined * outputs + (1-lambda_combined) * proxy_test2(features, model_proxies), 
+            dim=1
+        )
