@@ -110,10 +110,10 @@ class Trainer:
         
 
         # Train 데이터 로드 (매번 새로 전처리)
-        self.train_loader = load_train_data(batch_size, num_workers=4, segment_seconds=self.segment_seconds)
+        self.train_loader = load_train_data(batch_size, num_workers=4, segment_seconds=segment_seconds)
         
         # Test 데이터 로드 (train에서 전처리한 데이터 사용)
-        self.valid_loader = load_test_data(batch_size, num_workers=4, segment_seconds=self.segment_seconds)
+        self.valid_loader = load_test_data(batch_size, num_workers=4, segment_seconds=segment_seconds)
         self.test_loader = self.valid_loader
         
     
@@ -492,6 +492,6 @@ def main(segment_seconds):
 
 if __name__ == '__main__':
 
-    for segment_seconds in [5.5, 6.0, 6.5]:
+    for segment_seconds in [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]:
         main(segment_seconds)
 
