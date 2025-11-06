@@ -4,9 +4,11 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from sklearn.metrics import confusion_matrix, classification_report, f1_score
-
-from models import SEResNetLSTM, DCRNNModel
-from utils import load_test_data
+from loss_functions import setup_losses, compute_loss, get_predictions
+from models import SEResNetLSTM, DCRNNModel, UNet
+from utils import *
+from train import lambda_combined
+import test_analysis 
 
 # 전역 설정
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -15,7 +17,7 @@ classes = 5
 inputs = 1
 
 # 체크포인트 경로 (수정 필요)
-checkpoint_path = './logs/20251103_153826/checkpoints/best_model.pth'
+checkpoint_path = './logs/20251104_054038_UNet_rub0_7/checkpoints/best_model.pth'
 
 
 def load_model_from_checkpoint(checkpoint_path, device):
@@ -23,7 +25,8 @@ def load_model_from_checkpoint(checkpoint_path, device):
     print(f"\nLoading model from: {checkpoint_path}")
     
     # 모델 생성 (train.py와 동일한 모델 사용)
-    model = SEResNetLSTM(in_channel=inputs, num_classes=classes).to(device)
+    # model = SEResNetLSTM(in_channel=inputs, num_classes=classes, dilation=2).to(device)
+    model = UNet(nOUT=classes, in_channels=inputs, rub0_layers=7).to(device)
     # model = DCRNNModel(in_channel=inputs, num_classes=classes).to(device)
     
     # 체크포인트 로드
@@ -38,21 +41,100 @@ def load_model_from_checkpoint(checkpoint_path, device):
     return model
 
 
+'''
+맞춘 샘플 분석
+'''
+def plot_correct(model, pred_labels, true_labels, all_data, n_samples=10, class_names=['N', 'S', 'V', 'F', 'Q']):
+    
+    os.makedirs('correct_analysis', exist_ok=True)
+  
+    
+    correct = pred_labels == true_labels
+    
+    for class_idx in range(len(class_names)):
+        class_correct = correct & (true_labels == class_idx)
+        correct_indices = np.where(class_correct)[0]
+        
+        if len(correct_indices) == 0:
+            continue
+        
+        class_dir = f'correct_analysis/{class_names[class_idx]}'
+        os.makedirs(class_dir, exist_ok=True)
+        
+        # n_plot = min(n_samples, len(correct_indices))
+        
+        for i in range(20):
+            idx = correct_indices[i]
+            true_label = class_names[true_labels[idx]] # 실제 레이블
+            pred_label = class_names[pred_labels[idx]] # 예측 레이블
+            
+            plt.figure(figsize=(12, 3))
+            plt.plot(all_data.dataset[idx][0][0].squeeze(0), label='ECG')
+            plt.legend()
+            plt.xlabel('Time')
+            plt.ylabel('Amplitude')
+            plt.title(f'ECG : True: {true_label} / Pred: {pred_label}')
+            plt.tight_layout()
+            plt.savefig(f'{class_dir}/{class_names[class_idx]}_{i+1}_ecg.png', dpi=150, bbox_inches='tight')
+            plt.close()
+            
+'''
+틀린 샘플 분석
+'''
+def plot_misclassified(model, pred_labels, true_labels, all_data, n_samples=10, class_names=['N', 'S', 'V', 'F', 'Q']):
+    
+    os.makedirs('misclassified_analysis', exist_ok=True)
+    """ Temp """
+
+
+
+
+    """ Temp """
+    misclassified = pred_labels != true_labels
+    
+    for class_idx in range(len(class_names)):
+        class_wrong = misclassified & (true_labels == class_idx) 
+        wrong_indices = np.where(class_wrong)[0]
+        
+        if len(wrong_indices) == 0:
+            continue
+        
+        class_dir = f'misclassified_analysis/{class_names[class_idx]}'
+        os.makedirs(class_dir, exist_ok=True)
+
+        
+        for i in range(6):
+            idx = wrong_indices[i]
+
+            true_label = class_names[true_labels[idx]] # 실제 레이블
+            pred_label = class_names[pred_labels[idx]] # 예측 레이블
+            
+            plt.figure(figsize=(12, 3))
+            plt.plot(all_data.dataset[idx][0][0].squeeze(0), label='ECG')
+            plt.legend()
+            plt.xlabel('Time')
+            plt.ylabel('Amplitude')
+            plt.title(f'ECG : True: {true_label} / Pred: {pred_label}')
+            plt.tight_layout()
+            plt.savefig(f'{class_dir}/{class_names[class_idx]}_{i+1}_ecg.png', dpi=150, bbox_inches='tight')
+            plt.close()
+
 @torch.no_grad()
 def test_model(model, test_loader, device):
 
     model.eval()
     
     pred_labels, true_labels = [], []
-    
+    global lambda_combined
 
     for X, Y in tqdm(test_loader, desc="Test Progress"):
         X = X.float().to(device)
         Y = Y.long().to(device)
-        
+        lambda_combined = 0
         # 모델 예측
-        pred, _ = model(X, return_features=True)
-        pred = torch.argmax(pred, dim=1)
+        pred, features = model(X, return_features=True)
+        # pred = torch.argmax(pred, dim=1)
+        pred = get_predictions(pred, features, model.get_proxies() if lambda_combined < 1.0 else None)
         
         pred_labels.extend(pred.cpu().numpy())
         true_labels.extend(Y.cpu().numpy())
@@ -174,6 +256,8 @@ def main():
     # 결과 출력
     print_results(pred_labels, true_labels)
 
+    test_analysis.plot_misclassified(model, pred_labels, true_labels, test_loader, device)
+    test_analysis.plot_correct(model, pred_labels, true_labels, test_loader, device)
 
 if __name__ == '__main__':
     main()
