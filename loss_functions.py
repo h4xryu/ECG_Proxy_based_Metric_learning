@@ -148,6 +148,26 @@ def proxy_test(features, proxies, temperature=1.0, return_probs=True):
     return predictions
 
 
+def proxy_test2(features, proxies, temperature=1.0, return_probs=True):
+    """
+    Proxy 기반 추론: 가장 가까운 proxy로 분류
+    
+    Args:
+        features: [B, D] feature vectors
+        proxies: [C, D] proxy vectors
+        temperature: similarity scaling
+    
+    Returns:
+        predictions: [B] predicted class indices
+    """
+    x = F.normalize(features, dim=-1)
+    P = F.normalize(proxies, dim=-1)
+    
+    # 코사인 유사도 계산 및 temperature scaling
+    similarities = (x @ P.T) / temperature
+        
+    return similarities
+
 """
 ================================================================================
 LOSS SETUP & COMPUTATION
@@ -220,16 +240,9 @@ def compute_loss(outputs, features, labels, cross_entropy_loss,
 def get_predictions(outputs, features, model_proxies):
     """
     
-    - λ > 0: argmax 사용 (분류기 출력)
+    - λP: argmax 사용 (분류기 출력)
     - λ = 0: proxy inference 사용 (nearest proxy)
     """
     from train import lambda_combined
     
-    if lambda_combined > 0:
-        # Classification head를 사용한 예측
-        predictions = torch.argmax(outputs, dim=1)
-    else:
-        # Proxy-based inference (nearest proxy)
-        predictions = proxy_test(features, model_proxies)
-    
-    return predictions
+    return torch.argmax(lambda_combined * outputs + (1-lambda_combined) * proxy_test2(features, model_proxies), dim=1)
