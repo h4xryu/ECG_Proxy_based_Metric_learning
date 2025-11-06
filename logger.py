@@ -114,11 +114,14 @@ class Logger:
         # Class별 F1
         per_class_f1 = f1_score(y_true, y_pred, labels=list(range(self.num_classes)), average=None, zero_division=0)
         
+        # Per-class accuracy 계산
+        per_class_accuracy = (tp + tn) / (tp + tn + fp + fn + eps)
+        
         # Macro averages
         metrics['macro_sensitivity'] = float(np.mean(sensitivity))
         metrics['macro_specificity'] = float(np.mean(specificity))
         metrics['macro_precision'] = float(np.mean(ppv))
-
+        metrics['macro_per_class_accuracy'] = float(np.mean(per_class_accuracy))
         
         # Weighted averages
         class_counts = cm.sum(axis=1)
@@ -128,14 +131,15 @@ class Logger:
         metrics['weighted_sensitivity'] = float(np.sum(sensitivity * weights))
         metrics['weighted_specificity'] = float(np.sum(specificity * weights))
         metrics['weighted_precision'] = float(np.sum(ppv * weights))
-
+        metrics['weighted_per_class_accuracy'] = float(np.sum(per_class_accuracy * weights))
         
         # Per-class 저장
         metrics['per_class'] = {
             'sensitivity': sensitivity.tolist(),
             'specificity': specificity.tolist(),
             'precision': ppv.tolist(),
-            'f1': per_class_f1.tolist()
+            'f1': per_class_f1.tolist(),
+            'accuracy': per_class_accuracy.tolist()
         }
         
         return metrics
@@ -157,7 +161,7 @@ class Logger:
         self.writer.add_scalar('Valid/Weighted_F1', valid_metrics['weighted_f1'], epoch)
         self.writer.add_scalar('Valid/Macro_Sensitivity', valid_metrics['macro_sensitivity'], epoch)
         self.writer.add_scalar('Valid/Macro_Specificity', valid_metrics['macro_specificity'], epoch)
-        # 클래스별 sensitivity, specificity, precision, f1 로깅
+        # 클래스별 sensitivity, specificity, precision, f1, accuracy 로깅
         for i, class_name in enumerate(self.class_names):
             # 인덱스 범위 체크 (일부 클래스가 데이터에 없을 수 있음)
             if i < len(valid_metrics['per_class']['sensitivity']):
@@ -168,6 +172,8 @@ class Logger:
                 self.writer.add_scalar(f'Valid/{class_name}_Precision', valid_metrics['per_class']['precision'][i], epoch)
             if i < len(valid_metrics['per_class']['f1']):
                 self.writer.add_scalar(f'Valid/{class_name}_F1', valid_metrics['per_class']['f1'][i], epoch)
+            if i < len(valid_metrics['per_class']['accuracy']):
+                self.writer.add_scalar(f'Valid/{class_name}_Accuracy', valid_metrics['per_class']['accuracy'][i], epoch)
         
         self.writer.add_scalar('Learning_Rate', learning_rate, epoch)
         
@@ -189,7 +195,7 @@ class Logger:
         # 1. Per-class CSV
         with open(self.csv_per_class, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Class', 'Sensitivity', 'Precision', 'Specificity', 'F1-Score'])
+            writer.writerow(['Class', 'Sensitivity', 'Precision', 'Specificity', 'F1-Score', 'Accuracy'])
             
             per_class = best_metrics['per_class']
             for i, class_name in enumerate(self.class_names):
@@ -200,11 +206,13 @@ class Logger:
                         f"{per_class['sensitivity'][i]:.4f}",
                         f"{per_class['precision'][i]:.4f}",
                         f"{per_class['specificity'][i]:.4f}",
-                        f"{per_class['f1'][i]:.4f}"
+                        f"{per_class['f1'][i]:.4f}",
+                        f"{per_class['accuracy'][i]:.4f}"
                     ])
                 else:
                     writer.writerow([
                         class_name,
+                        "N/A",
                         "N/A",
                         "N/A",
                         "N/A",
@@ -259,7 +267,7 @@ class Logger:
             f.write(f"Macro Specificity: {best_metrics['macro_specificity']:.4f}\n")
             f.write("="*70 + "\n")
         
-        print(f"✓ Summary saved: {summary_path}")
+        print(f"Summary saved: {summary_path}")
     
     def close(self):
         """로거 종료"""
