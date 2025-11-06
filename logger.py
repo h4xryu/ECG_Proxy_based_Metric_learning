@@ -171,13 +171,14 @@ class Logger:
         
         self.writer.add_scalar('Learning_Rate', learning_rate, epoch)
         
-        # Console
-        print(f'\nEPOCH [{epoch}] '
-              f'Train Loss: {train_metrics.get("loss", 0):.6f} | '
-              f'Valid Loss: {valid_metrics.get("loss", 0):.6f} | '
-              f'Acc: {valid_metrics["accuracy"]:.4f} | '
-              f'F1: {valid_metrics["macro_f1"]:.4f} | '
-              f'LR: {learning_rate:.2e} | '
+        # Console - 깔끔한 에포크 진행 출력
+        print(f'\n{"─"*90}')
+        print(f'Epoch [{epoch:>3d}]  '
+              f'TrainLoss: {train_metrics.get("loss", 0):.6f}  '
+              f'ValidLoss: {valid_metrics.get("loss", 0):.6f}  '
+              f'Acc: {valid_metrics["accuracy"]*100:6.2f}%  '
+              f'F1: {valid_metrics["macro_f1"]:.4f}  '
+              f'LR: {learning_rate:.2e}  '
               f'Time: {epoch_time:.1f}s')
     
     def save_best_results_csv(self, best_metrics, best_epoch):
