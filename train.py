@@ -25,9 +25,9 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 """
 
 # 전역 학습 설정
-batch_size = 256
+batch_size = 512
 nepoch = 50
-lr_initial = 1e-4
+lr_initial = 0.0005
 decay_epoch = 20
 device = 'cuda'
 
@@ -37,11 +37,13 @@ inputs = 1
 model_path = './checkpoints/best_model.pth'
 
 
+
 # Loss 설정
+
 # λ로 Loss function 결합:
 # - λ = 1.0: CE only
 # - λ = 0.0: Proxy only
-# - 0 < λ < 1: Combined (λ*CE + (1-λ)*Proxy)
+# - 0 < λ < 1: Combined (λ*CE + (1-λ)*Proxy),
 lambda_combined = 1
 
 # Proxy Loss 파라미터
@@ -50,7 +52,7 @@ proxy_alpha = 32.0
 proxy_delta = 0.1
 
 # 데이터 전처리 설정 (매번 새로 전처리됨)
-segment_seconds = 5.0  # ECG 세그먼트 길이 (초) - 논문 방식: 5.0초 (1800 샘플)
+segment_seconds = 2.0  # ECG 세그먼트 길이 (초) - 논문 방식: 5.0초 (1800 샘플)
 fs_out = 360           # 출력 샘플링 주파수 (Hz)
 ecg_leads = ['MLII']   # 사용할 ECG 리드 ['MLII'], ['V1'], ['MLII', 'V1'] 등
 
@@ -86,17 +88,20 @@ class Trainer:
 
     """================================================================================학습세팅================================================================================"""
 
+ 
     def _setup_model(self):
         """모델 초기화"""
         global inputs, classes
         
-        # self.model = SEResNetLSTM(in_channel=inputs, num_classes=classes).to(self.device)    
-        self.model = UNet(nOUT=classes, in_channels=inputs, rub0_layers=7).to(self.device)
+        # self.model = SEResNetLSTM(in_channel=inputs, num_classes=classes, dilation=2).to(self.device)    
+        # self.model = UNet(nOUT=classes, in_channels=inputs, rub0_layers=7).to(self.device)
+        self.model = HUnivModel(nOUT=classes, in_channels=inputs).to(self.device)
         # self.model = DCRNNModel(in_channel=inputs, num_classes=classes).to(self.device)
 
         total_params = sum(p.numel() for p in self.model.parameters())
         print(f"\n{'='*70}")
         print(f"Model Parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+        
         print(f"{'='*70}\n")
     
     
@@ -119,7 +124,7 @@ class Trainer:
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=lr_initial,
-            weight_decay=0.001,
+            weight_decay=0.002,
             betas=(0.9, 0.999)
         )
 
@@ -136,9 +141,7 @@ class Trainer:
     
     def _init_tracking_vars(self):
         """추적 변수 초기화"""
-        self.best_valid_f1 = 0.0
-        self.best_metrics = {}
-        self.best_model_path = None
+        self.final_metrics = {}
 
     def train(self):
         """===============================================학습 실행================================================"""
@@ -152,16 +155,6 @@ class Trainer:
             # 에포크별 학습 및 검증
             train_loss = self._train_epoch(epoch)
             valid_metrics, valid_loss = self._evaluate()
-            
-            # 최고 성능 모델 추적
-            is_best = valid_metrics['macro_f1'] > self.best_valid_f1
-            if is_best:
-                self.best_valid_f1 = valid_metrics['macro_f1']
-                self.best_metrics = valid_metrics.copy()
-                self.best_metrics['epoch'] = epoch
-
-            # 체크포인트 저장
-            self._save_checkpoint(epoch, valid_metrics['macro_f1'], is_best)
 
             # 학습률 스케줄링
             current_lr = self.scheduler.get_last_lr()[0]
@@ -172,24 +165,33 @@ class Trainer:
             train_metrics = {'loss': train_loss}
             valid_metrics['loss'] = valid_loss
             self.logger.log_epoch(epoch, train_metrics, valid_metrics, current_lr, epoch_time)
+            
+            # 마지막 에포크 처리
+            if epoch == nepoch:
+                self.final_metrics = valid_metrics.copy()
+                self.final_metrics['epoch'] = epoch
+                # 최종 모델 저장
+                self._save_final_checkpoint(epoch, valid_metrics['macro_f1'])
 
-        # 학습 완료 후 최고 모델로 테스트
-        print('\n' + '='*80)
-        print('='*80)
-        self._test_with_best_model()
+        # 50 에포크 학습 완료 후 최종 모델로 테스트
+        print('\n' + '='*90)
+        print(" " * 27 + "TRAINING COMPLETED")
+        print('='*90)
+        print(f"\nFinal Epoch [{nepoch}] Validation F1: {self.final_metrics['macro_f1']:.4f}")
+        print(f"Testing with final model (Epoch {nepoch})...")
+        print('='*90 + '\n')
+        
+        self._test_final_model()
 
-        # 베스트 결과 CSV 저장
-        if self.best_metrics:
-            self.logger.save_best_results_csv(self.best_metrics, self.best_metrics.get('epoch', 0))
+        # 최종 결과 CSV 저장
+        if self.final_metrics:
+            self.logger.save_best_results_csv(self.final_metrics, nepoch)
         
         # 실험 정리
-        self.logger.finalize_experiment(self.best_metrics)
+        self.logger.finalize_experiment(self.final_metrics)
         self.logger.close()
         
-        print('\n' + '='*80)
-        print('Training and testing completed.')
-        print(f"Best validation F1: {self.best_valid_f1:.4f} at epoch {self.best_metrics.get('epoch', 'N/A')}")
-        print('='*80 + '\n')
+  
 
     def _compute_loss(self, outputs, features, labels):
         global lambda_combined
@@ -213,18 +215,21 @@ class Trainer:
         for X, Y in pbar:
             X, Y = X.float().to(self.device), Y.long().to(self.device)
             
-            outputs, features = self.model(X, return_features=True)
+            outputs, features = self.model(X)
             loss, proxy_loss, ce_loss = self._compute_loss(outputs, features, Y)
-            
+
+            l1_loss = l1_regularization(self.model, lambda_l1=0.001)
             self.optimizer.zero_grad()
+            loss = loss + l1_loss
             loss.backward()
             self.optimizer.step()
             
-            total_loss += loss.item()
+            total_loss += loss.item() 
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
         return total_loss / len(self.train_loader)
 
+    @torch.no_grad()
     def _evaluate(self, data_loader=None):
         """모델 평가"""
         global lambda_combined
@@ -240,8 +245,11 @@ class Trainer:
             for X, Y in tqdm(data_loader, desc="Evaluation"):
                 X, Y = X.float().to(self.device), Y.long().to(self.device)
                 
-                outputs, features = self.model(X, return_features=True)
+                outputs, features = self.model(X)
                 loss, _, _ = self._compute_loss(outputs, features, Y)
+
+                l1_loss = l1_regularization(self.model, lambda_l1=0.001)
+                loss = loss + l1_loss
                 total_loss += loss.item()
 
                 probas = torch.softmax(outputs, dim=1)
@@ -262,19 +270,11 @@ class Trainer:
         
         return metrics, avg_loss
 
-    def _load_best_model(self):
-        """최고 성능 모델 체크포인트 로드"""
-        load_best_model(self.model, self.best_model_path, self.device)
-    
     @torch.no_grad()
-    def _test_with_best_model(self):
-        """
-        최고 성능 모델로 테스트 수행
-        Proxy Loss 사용 시 거리 기반 예측 적용
-        """
+    def _test_final_model(self):
+  
         global lambda_combined
         
-        self._load_best_model()
         self.model.eval()
         
         pred_labels, true_labels = [], []
@@ -286,7 +286,7 @@ class Trainer:
                 Y = Y.long().to(self.device)
                 
                 # 모델 출력
-                outputs, features = self.model(X, return_features=True)
+                outputs, features = self.model(X)
                 
                 # lambda_combined에 따라 예측 방식 결정
                 preds = get_predictions(
@@ -365,89 +365,91 @@ class Trainer:
 
     def _print_test_results(self, all_class_metrics, class_names, cm, true_labels, pred_labels):
         """
-        테스트 결과 출력 (confusion matrix와 classification report 포함)
+        50 에포크 학습 후 최종 성능 결과 출력
         """
-        print("\n" + "="*80)
-        print("FINAL TEST RESULTS (Best Model Selected by Test Set)")
-        print("="*80)
-        print(f"Overall Accuracy: {all_class_metrics['accuracy']:.4f}")
-        print(f"Macro F1: {all_class_metrics['macro_f1']:.4f}")
-        print(f"Weighted F1: {all_class_metrics['weighted_f1']:.4f}")
+        print("\n" + "="*90)
+        print(" " * 25 + "TEST RESULTS (Epoch 50)")
+        print("="*90)
         
-        # Confusion Matrix 출력
-        print("\n" + "="*80)
-        print("CONFUSION MATRIX")
-        print("="*80)
-        print(f"{'':>10}", end="")
-        for name in class_names:
-            print(f"{name:>10}", end="")
-        print()
-        print("-"*80)
+        # 핵심 성능 지표
+        print("\n┌─ OVERALL PERFORMANCE " + "─" * 65 + "┐")
+        print(f"│  Overall Accuracy : {all_class_metrics['accuracy']*100:6.2f}%")
+        print(f"│  Macro F1-Score   : {all_class_metrics['macro_f1']:.4f}")
+        print(f"│  Weighted F1-Score: {all_class_metrics['weighted_f1']:.4f}")
+        print("└" + "─" * 88 + "┘")
+        
+        # Per-Class Performance 테이블
+        print("\n┌─ PER-CLASS METRICS (N, S, V, F, Q) " + "─" * 51 + "┐")
+        print(f"│  {'Class':<8} {'Sens':<8} {'Spec':<8} {'PPV':<8} {'F1':<8} {'Support':<10}")
+        print(f"│  {'-'*70}")
         
         for i, name in enumerate(class_names):
+            if i < len(all_class_metrics['acc_per_class']):
+                support = int(np.sum(true_labels == i))
+                print(f"│  {name:<8} "
+                    f"{all_class_metrics['sensitivity'][i]:<8.4f} "
+                    f"{all_class_metrics['specificity'][i]:<8.4f} "
+                    f"{all_class_metrics['ppv'][i]:<8.4f} "
+                    f"{all_class_metrics['f1'][i]:<8.4f} "
+                    f"{support:<10}")
+            else:
+                print(f"│  {name:<8} {'N/A':<8} {'N/A':<8} {'N/A':<8} {'N/A':<8} {'0':<10}")
+        
+        print(f"│  {'-'*70}")
+        print(f"│  {'MACRO':<8} "
+            f"{all_class_metrics['weighted_sensitivity']:<8.4f} "
+            f"{all_class_metrics['weighted_specificity']:<8.4f} "
+            f"{all_class_metrics['weighted_ppv']:<8.4f} "
+            f"{all_class_metrics['macro_f1']:<8.4f} "
+            f"{len(true_labels):<10}")
+        print("└" + "─" * 88 + "┘")
+        
+        # Confusion Matrix
+        print("\n┌─ CONFUSION MATRIX " + "─" * 69 + "┐")
+        print("│  " + f"{'Pred →':<10}", end="")
+        for name in class_names:
             print(f"{name:>10}", end="")
+        print("  │")
+        print("│  Actual ↓ " + "-" * 52 + " │")
+        
+        for i, name in enumerate(class_names):
+            print("│  " + f"{name:<10}", end="")
             for j in range(len(class_names)):
                 print(f"{cm[i, j]:>10}", end="")
-            print()
+            print("  │")
+        print("└" + "─" * 88 + "┘")
         
-        # Classification Report 출력
-        print("\n" + "="*80)
-        print("CLASSIFICATION REPORT (sklearn)")
-        print("="*80)
+        # sklearn Classification Report
+        print("\n┌─ DETAILED CLASSIFICATION REPORT " + "─" * 54 + "┐")
         report = classification_report(
             true_labels, 
             pred_labels, 
-            labels=[0, 1, 2, 3, 4],  # N, S, V, F, Q 5개 클래스 모두 명시
+            labels=[0, 1, 2, 3, 4],
             target_names=class_names,
             digits=4,
             zero_division=0
         )
-        print(report)
+        for line in report.split('\n'):
+            if line.strip():
+                print(f"│  {line:<84}  │")
+        print("└" + "─" * 88 + "┘\n")
         
-        # Custom Metrics 출력
-        print("\n" + "-"*80)
-        print("CUSTOM METRICS (ALL CLASSES: N, S, V, F, Q)")
-        print("-"*80)
-        print(f"{'Class':<10} {'Acc':<10} {'Sens':<10} {'Spec':<10} {'PPV':<10} {'F1':<10}")
-        print("-"*80)
-        
-        for i, name in enumerate(class_names):
-            # 인덱스 범위 체크 (일부 클래스가 데이터에 없을 수 있음)
-            if i < len(all_class_metrics['acc_per_class']):
-                print(f"{name:<10} "
-                    f"{all_class_metrics['acc_per_class'][i]:<10.4f} "
-                    f"{all_class_metrics['sensitivity'][i]:<10.4f} "
-                    f"{all_class_metrics['specificity'][i]:<10.4f} "
-                    f"{all_class_metrics['ppv'][i]:<10.4f} "
-                    f"{all_class_metrics['f1'][i]:<10.4f} "
-                    )
-            else:
-                print(f"{name:<10} {'N/A':<10} {'N/A':<10} {'N/A':<10} {'N/A':<10} {'N/A':<10}")
-        print("-"*80)
-        print(f"{'MACRO AVG':<10} "
-            f"{'':<10} "
-            f"{all_class_metrics['weighted_sensitivity']:<10.4f} "
-            f"{all_class_metrics['weighted_specificity']:<10.4f} "
-            f"{all_class_metrics['weighted_ppv']:<10.4f} "  
-            f"{all_class_metrics['macro_f1']:<10.4f} "
-            )
-        print("\n" + "-"*80)
-        print("="*80 + "\n")
+        print("="*90 + "\n")
     
-    def _save_checkpoint(self, epoch, f1_score, is_best): 
+    def _save_final_checkpoint(self, epoch, f1_score): 
         """
-        체크포인트 저장
-
+        최종 에포크 체크포인트 저장
         """
         model_dir = get_model_dir(self.logger.log_dir)
         checkpoint = create_checkpoint(
             self.model, self.optimizer, self.scheduler,
-            epoch, f1_score, self.best_valid_f1, self.class_names
+            epoch, f1_score, f1_score, self.class_names
         )
         
-        best_path = save_checkpoint(checkpoint, model_dir, epoch, is_best)
-        if best_path:
-            self.best_model_path = best_path
+        # 최종 모델만 저장
+        final_path = os.path.join(model_dir, 'final_model.pth')
+        torch.save(checkpoint, final_path)
+        print(f"Final model saved: {final_path}")
 
     def _setup_losses(self):
         """손실 함수 초기화"""
@@ -487,134 +489,7 @@ def main():
     trainer.train()
 
 
-def main_receptive_field_experiments():
-    """
-    Receptive Field 실험 자동화
-    
-    실험 1-4: UNet rub0_layers [5, 6, 7, 8]
-    실험 5-9: SE-ResNet-LSTM dilation [1, 2, 3, 4, 5]
-    """
-    global lambda_combined, classes, inputs
-    
-    print("\n" + "="*80)
-    print("RECEPTIVE FIELD EXPERIMENTS - CE LOSS ONLY")
-    print("="*80)
-    print(f"Total Experiments: 9")
-    print(f"  - UNet (rub0_layers): 4 experiments")
-    print(f"  - SE-ResNet-LSTM (dilation): 5 experiments")
-    print(f"  - lambda_combined: 1.0 (CE only)")
-    print("="*80 + "\n")
-    
-    # ===== 실험 1-4: UNet rub0_layers =====
-    print("\n" + "="*80)
-    print("PART 1: UNet Receptive Field Test")
-    print("="*80 + "\n")
-    
-    rub0_layers_list = [5, 6, 7, 8]
-    
-    for exp_num, rub0_layers in enumerate(rub0_layers_list, start=1):
-        print(f"\n{'='*80}")
-        print(f"Experiment {exp_num}/9: UNet with rub0_layers={rub0_layers}")
-        print(f"{'='*80}\n")
-        
-        # CE only로 고정
-        globals()['lambda_combined'] = 1.0
-        print(f"[DEBUG] lambda_combined set to: {globals()['lambda_combined']}")
-        
-        set_seed()
-        
-        # 모델 변경을 위한 Trainer 수정
-        class UNetTrainer(Trainer):
-            def _setup_model(self):
-                self.model = UNet(nOUT=classes, in_channels=inputs, rub0_layers=rub0_layers).to(self.device)
-                total_params = sum(p.numel() for p in self.model.parameters())
-                print(f"\n{'='*70}")
-                print(f"Model: UNet (rub0_layers={rub0_layers})")
-                print(f"Model Parameters: {total_params:,} ({total_params/1e6:.2f}M)")
-                print(f"{'='*70}\n")
-            
-            def _setup_logger(self):
-                """로거 초기화 with 실험 정보"""
-                from datetime import datetime
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                exp_name = f"UNet_rub0_{rub0_layers}"
-                log_dir = os.path.join(os.getcwd(), 'logs', f'{timestamp}_{exp_name}')
-                
-                os.makedirs(os.path.join(log_dir, 'tensorboard'), exist_ok=True)
-                os.makedirs(os.path.join(log_dir, 'checkpoints'), exist_ok=True)
-                
-                self.logger = Logger(os.path.join(log_dir, 'tensorboard'), self.class_names)
-        
-        trainer = UNetTrainer()
-        trainer.train()
-        
-        print(f"\n{'='*80}")
-        print(f"Experiment {exp_num}/9 Completed: UNet rub0_layers={rub0_layers}")
-        print(f"{'='*80}\n")
-    
-    # ===== 실험 5-9: SE-ResNet-LSTM dilation =====
-    print("\n" + "="*80)
-    print("PART 2: SE-ResNet-LSTM Dilation Test")
-    print("="*80 + "\n")
-    
-    dilation_list = [1, 2, 3, 4, 5]
-    
-    for exp_num, dilation in enumerate(dilation_list, start=5):
-        print(f"\n{'='*80}")
-        print(f"Experiment {exp_num}/9: SE-ResNet-LSTM with dilation={dilation}")
-        print(f"{'='*80}\n")
-        
-        # CE only로 고정
-        globals()['lambda_combined'] = 1.0
-        print(f"[DEBUG] lambda_combined set to: {globals()['lambda_combined']}")
-        
-        set_seed()
-        
-        # SE-ResNet-LSTM with dilation
-        class SEResNetLSTMTrainer(Trainer):
-            def _setup_model(self):
-                self.model = SEResNetLSTM(
-                    in_channel=inputs, 
-                    num_classes=classes,
-                    dilation=dilation
-                ).to(self.device)
-                total_params = sum(p.numel() for p in self.model.parameters())
-                print(f"\n{'='*70}")
-                print(f"Model: SE-ResNet-LSTM (dilation={dilation})")
-                print(f"Model Parameters: {total_params:,} ({total_params/1e6:.2f}M)")
-                print(f"{'='*70}\n")
-            
-            def _setup_logger(self):
-                """로거 초기화 with 실험 정보"""
-                from datetime import datetime
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                exp_name = f"SEResNetLSTM_dilation_{dilation}"
-                log_dir = os.path.join(os.getcwd(), 'logs', f'{timestamp}_{exp_name}')
-                
-                os.makedirs(os.path.join(log_dir, 'tensorboard'), exist_ok=True)
-                os.makedirs(os.path.join(log_dir, 'checkpoints'), exist_ok=True)
-                
-                self.logger = Logger(os.path.join(log_dir, 'tensorboard'), self.class_names)
-        
-        trainer = SEResNetLSTMTrainer()
-        trainer.train()
-        
-        print(f"\n{'='*80}")
-        print(f"Experiment {exp_num}/9 Completed: SE-ResNet-LSTM dilation={dilation}")
-        print(f"{'='*80}\n")
-    
-    print("\n" + "="*80)
-    print("ALL 9 EXPERIMENTS COMPLETED!")
-    print("="*80)
-    print("Summary:")
-    print("  - UNet (rub0_layers=5,6,7,8): 4 experiments")
-    print("  - SE-ResNet-LSTM (dilation=1,2,3,4,5): 5 experiments")
-    print("  - Total: 9 experiments")
-    print("="*80 + "\n")
-
-
-# if __name__ == '__main__':
-#     main()
 
 if __name__ == '__main__':
-    main_receptive_field_experiments()
+    main()
+
