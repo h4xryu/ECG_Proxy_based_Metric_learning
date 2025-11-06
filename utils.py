@@ -496,7 +496,7 @@ def extract_beats(record_path, record_name, leads, fs_out=360, segment_seconds=1
     논문 방식으로 5초 세그먼트를 사용하려면 extract_5s_segments 사용
     """
     # 5초 세그먼트 방식 사용 (논문 방식)
-    if segment_seconds >= 3.0:
+    if segment_seconds >= 1.0:
         return extract_5s_segments(record_path, record_name, leads, fs_out, segment_seconds, plot_debug)
     
     # 기존 방식 (단일 비트 추출) - 하위 호환성
@@ -664,7 +664,7 @@ def load_train_data(batch_size, num_workers=0):
         num_workers=num_workers
     )
     
-    return train_loader
+    return train_loader 
 
 
 def load_test_data(batch_size, num_workers=0):
@@ -891,7 +891,7 @@ if __name__ == '__main__':
     
     
     train_beats, train_labels, train_groups = process_records(
-        './data/mit-bih-arrhythmia-database-1.0.0', DS1_TRAIN_RECORDS, ['MLII'], 360, 5,
+        './data/mit-bih-arrhythmia-database-1.0.0', DS1_TRAIN_RECORDS, ['MLII'], 360, 2,
         desc="DS1 Train",
         plot_debug=True
     )
