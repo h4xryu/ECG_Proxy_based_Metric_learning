@@ -492,6 +492,7 @@ def extract_5s_segments(record_path, record_name, leads, fs_out=360, segment_sec
 # 이전 방식도 유지 (호환성)
 def extract_beats(record_path, record_name, leads, fs_out=360, segment_seconds=1.0, plot_debug=False):
     """MIT-BIH 레코드에서 비트 추출 및 전처리
+
     
     논문 방식으로 5초 세그먼트를 사용하려면 extract_5s_segments 사용
     """
@@ -632,13 +633,13 @@ def preprocess_and_cache_mitbih(data_path, output_base_dir, segment_seconds, fs_
     return cache_dir
 
 
-def load_train_data(batch_size, num_workers=0):
+def load_train_data(batch_size, num_workers=0, segment_seconds=1.0):
     """
     학습 데이터 로드 (train.py 전역변수 사용)
     매번 새로 전처리
     """
     from train import (path_mitbih_raw, path_processed_base, 
-                       segment_seconds, fs_out, ecg_leads)
+                        fs_out, ecg_leads)
     
     # 전처리 (매번 새로)
     cache_dir = preprocess_and_cache_mitbih(
