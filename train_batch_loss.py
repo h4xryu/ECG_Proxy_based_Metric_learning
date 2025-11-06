@@ -38,6 +38,7 @@ model_path = './checkpoints/best_model.pth'
 
 
 
+segment_seconds = 2.0
 # Loss 설정
 
 
@@ -89,8 +90,8 @@ class Trainer:
         global inputs, classes
         
         # self.model = SEResNetLSTM(in_channel=inputs, num_classes=classes, dilation=2).to(self.device)    
-        # self.model = UNet(nOUT=classes, in_channels=inputs, rub0_layers=7).to(self.device)
-        self.model = HUnivModel(nOUT=classes, in_channels=inputs).to(self.device)
+        self.model = UNet(nOUT=classes, in_channels=inputs, rub0_layers=6, inconv_size=5).to(self.device)
+        # self.model = HUnivModel(nOUT=classes, in_channels=inputs).to(self.device)
         # self.model = DCRNNModel(in_channel=inputs, num_classes=classes).to(self.device)
 
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -105,10 +106,10 @@ class Trainer:
         
 
         # Train 데이터 로드 (매번 새로 전처리)
-        self.train_loader = load_train_data(batch_size, num_workers=4, segment_seconds=self.segment_seconds)
+        self.train_loader = load_train_data(batch_size, num_workers=4)
         
         # Test 데이터 로드 (train에서 전처리한 데이터 사용)
-        self.valid_loader = load_test_data(batch_size, num_workers=4, segment_seconds=self.segment_seconds)
+        self.valid_loader = load_test_data(batch_size, num_workers=4)
         self.test_loader = self.valid_loader
         
     
@@ -490,7 +491,7 @@ if __name__ == '__main__':
     for lambda_val in [-1.0, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0]:
         lambda_combined = lambda_val  # 전역 변수에 할당
         
-        for segment_seconds in [3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5]:
+        for segment_seconds in [2.0]:
             print(f"\n{'='*90}")
             print(f"Starting experiment: lambda={lambda_combined}, segment={segment_seconds}s")
             print(f"{'='*90}\n")
